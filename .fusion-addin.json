@@ -1,0 +1,6 @@
+{
+  "name": "ExporTo",
+  "display_name": "ExporTo",
+  "description": "Send Fusion models as STEP or STL to locally installed applications.",
+  "initialized": true
+}

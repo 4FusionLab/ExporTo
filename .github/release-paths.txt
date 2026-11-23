@@ -1,0 +1,5 @@
+# Files that affect the installable package.
+ExporTo/**
+scripts/build.py
+.fusion-addin.json
+LICENSE
