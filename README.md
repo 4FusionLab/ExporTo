@@ -11,9 +11,11 @@
 
 ## Export from the design browser
 
-1. Right-click the design root, a component, or a subassembly.
-2. Open **Export to** and choose an application for STEP, or open **STL** and choose a mesh application.
-3. For a single solid body, use **Export to → STL**. STL files use millimeters.
+1. Select one or more bodies, components, or subassemblies, or select the design root. Right-click the selection.
+2. For STEP, open **Export to**. For a mesh in millimeters, open **Export to → STL**.
+3. Choose **File…** to save locally, or choose an application to open the export.
+
+A multi-selection exports to one file with the bodies in their assembly positions.
 
 The menu shows applications available on your computer. Common options include Bambu Studio, OrcaSlicer, PrusaSlicer, and FreeCAD. When Blender is installed, **Export to → STL → Blender** opens a new scene with the mesh. ExporTo uses installed application icons when available.
 

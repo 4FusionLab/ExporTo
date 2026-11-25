@@ -1,5 +1,6 @@
 """Send Fusion models to local applications from the context menu."""
 
+from collections import deque
 from errno import ENOTEMPTY, EEXIST
 import hashlib
 import importlib.util
@@ -19,6 +20,7 @@ PREFIX = "ExporTo_"
 CACHE_PREFIX = "ExporTo-"
 CACHE_DIRECTORY = re.compile(r"ExporTo-[a-z0-9_]{8}")
 CACHE_COMMAND = PREFIX + "ClearCache"
+SELECTION_EXPORT_EVENT = PREFIX + "SelectionExport"
 APP_REFRESH_SECONDS = 20
 HERE = Path(__file__).resolve().parent
 RESOURCES = HERE / "resources"
@@ -29,13 +31,17 @@ _spec.loader.exec_module(platform_apps)
 _addin = None
 
 
-def export_path(name, suffix):
+def export_filename(name, suffix):
     filename = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
     filename = filename.encode("utf-8")[:200].decode("utf-8", errors="ignore").rstrip(" .")
     if re.fullmatch(r"(?i:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])", filename.split(".", 1)[0]):
         filename = "_" + filename
+    return f"{filename or 'Model'}{suffix}"
+
+
+def export_path(name, suffix):
     directory = Path(tempfile.mkdtemp(prefix=CACHE_PREFIX))
-    return directory / f"{filename or 'Model'}{suffix}"
+    return directory / export_filename(name, suffix)
 
 
 def cached_files():
@@ -91,6 +97,53 @@ def export_model(design, entity, path):
         raise RuntimeError(f"Fusion did not produce a {fmt.upper()} file.")
 
 
+def selection_bodies(entity):
+    if body := adsk.fusion.BRepBody.cast(entity):
+        yield body
+        return
+    yield from (body for body in entity.bRepBodies if body.isLightBulbOn)
+    occurrence = adsk.fusion.Occurrence.cast(entity)
+    children = occurrence.childOccurrences if occurrence else entity.occurrences
+    for child in children:
+        if child.isLightBulbOn:
+            yield from selection_bodies(child)
+
+
+def export_selection(design, entities, fmt, path):
+    if not needs_export_document(entities, fmt):
+        export_model(design, entities[0], path)
+        return
+
+    bodies = []
+    for entity in entities:
+        for body in selection_bodies(entity):
+            if body not in bodies:
+                bodies.append(body)
+    if not bodies:
+        raise RuntimeError("The selection contains no bodies to export.")
+
+    # Copies of assembly-context bodies retain their placement in the assembly.
+    manager = adsk.fusion.TemporaryBRepManager.get()
+    copies = [(body.name, manager.copy(body)) for body in bodies]
+    app = adsk.core.Application.get()
+    document = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    try:
+        design = adsk.fusion.Design.cast(document.products.itemByProductType("DesignProductType"))
+        design.designType = adsk.fusion.DesignTypes.DirectDesignType
+        for name, copy in copies:
+            exported_body = design.rootComponent.bRepBodies.add(copy) if copy else None
+            if not exported_body:
+                raise RuntimeError(f"Fusion could not prepare {name} for export.")
+            exported_body.name = name
+        export_model(design, design.rootComponent, path)
+    finally:
+        document.close(False)
+
+
+def needs_export_document(entities, fmt):
+    return len(entities) > 1 or (fmt == "step" and bool(adsk.fusion.BRepBody.cast(entities[0])))
+
+
 class MenuHandler(adsk.core.MarkingMenuEventHandler):
     def __init__(self, addin):
         super().__init__()
@@ -113,16 +166,18 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
         target = self.addin.menu_target
         self.addin.menu_target = None
-        if self.destination and not target:
+        if self.fmt and not target:
             return
         command = args.command
         command.isExecutedWhenPreEmpted = False
 
         def execute(_args):
-            if self.destination:
-                self.addin.export(self.destination, self.fmt, *target)
-            else:
+            if not self.fmt:
                 self.addin.clear_cache()
+            elif needs_export_document(target[2], self.fmt):
+                self.addin.queue_export(self.destination, self.fmt, target)
+            else:
+                self.addin.export(self.destination, self.fmt, *target)
 
         def destroy(_args):
             self.addin.command_handlers.discard(handlers)
@@ -142,6 +197,17 @@ class CommandHandler(adsk.core.CommandEventHandler):
         self.callback(args)
 
 
+class SelectionExportHandler(adsk.core.CustomEventHandler):
+    def __init__(self, addin):
+        super().__init__()
+        self.addin = addin
+
+    def notify(self, _args):
+        if self.addin.pending_exports:
+            destination, fmt, target = self.addin.pending_exports.popleft()
+            self.addin.export(destination, fmt, *target)
+
+
 class Addin:
     def __init__(self):
         self.app = adsk.core.Application.get()
@@ -155,6 +221,10 @@ class Addin:
         self.destination_icons = {}
         self.refresh_at = 0
         self.clear_definition = None
+        self.file_definitions = {}
+        self.export_event = None
+        self.export_handler = SelectionExportHandler(self)
+        self.pending_exports = deque()
 
     def add_command(self, id, name, hint, icon, handler):
         definition = self.ui.commandDefinitions.addButtonDefinition(id, name, hint, str(icon))
@@ -164,6 +234,14 @@ class Addin:
         return definition
 
     def start(self):
+        self.export_event = self.app.registerCustomEvent(SELECTION_EXPORT_EVENT)
+        if not self.export_event or not self.export_event.add(self.export_handler):
+            raise RuntimeError("Fusion could not register the selection export event.")
+        for fmt in self.destinations:
+            self.file_definitions[fmt] = self.add_command(
+                PREFIX + fmt + "_File", "File…", f"Save the selection as a {fmt.upper()} file.",
+                RESOURCES / "export", CreatedHandler(self, fmt=fmt),
+            )
         self.clear_definition = self.add_command(
             CACHE_COMMAND, "Clear cache", "Delete temporary STEP and STL files created by ExporTo.",
             RESOURCES / "clear", CreatedHandler(self),
@@ -173,6 +251,9 @@ class Addin:
 
     def stop(self):
         self.ui.markingMenuDisplaying.remove(self.menu_handler)
+        if self.export_event:
+            self.app.unregisterCustomEvent(SELECTION_EXPORT_EVENT)
+        self.pending_exports.clear()
         for definition in self.definitions.values():
             if definition.isValid:
                 definition.deleteMe()
@@ -201,31 +282,37 @@ class Addin:
         self.menu_target = None
         entities = args.selectedEntities
         design = adsk.fusion.Design.cast(self.app.activeProduct)
-        if not design or not entities or len(entities) != 1 or not entities[0]:
+        if not design or not entities:
             return
-        selected = entities[0]
-        entity = adsk.fusion.Occurrence.cast(selected) or adsk.fusion.Component.cast(selected)
-        body = None if entity else adsk.fusion.BRepBody.cast(selected)
-        if not entity and not body:
-            return
+        selection = []
+        for selected in entities:
+            entity = (adsk.fusion.Occurrence.cast(selected) or adsk.fusion.Component.cast(selected)
+                      or adsk.fusion.BRepBody.cast(selected))
+            if not entity:
+                return
+            selection.append(entity)
 
         if time.monotonic() >= self.refresh_at:
             self.refresh_apps()
 
         menu = args.linearMarkingMenu.controls.addDropDown("Export to", str(RESOURCES / "export"), PREFIX + "Menu")
-        step_apps = self.destinations["step"] if entity else []
-        for destination in step_apps:
+        menu.controls.addCommand(self.file_definitions["step"])
+        for destination in self.destinations["step"]:
             menu.controls.addCommand(self.destination_definition(destination, "step"))
-        stl_apps = self.destinations["stl"]
-        if stl_apps:
-            stl = menu.controls.addDropDown("STL", str(RESOURCES / "stl"), PREFIX + "STLMenu")
-            for destination in stl_apps:
-                stl.controls.addCommand(self.destination_definition(destination, "stl"))
-        if step_apps or stl_apps:
-            menu.controls.addSeparator(PREFIX + "CacheSeparator")
+        stl = menu.controls.addDropDown("STL", str(RESOURCES / "stl"), PREFIX + "STLMenu")
+        stl.controls.addCommand(self.file_definitions["stl"])
+        for destination in self.destinations["stl"]:
+            stl.controls.addCommand(self.destination_definition(destination, "stl"))
+        menu.controls.addSeparator(PREFIX + "CacheSeparator")
         self.refresh_cache_label()
         menu.controls.addCommand(self.clear_definition)
-        self.menu_target = (self.app.activeDocument, design, entity or body)
+        self.menu_target = (self.app.activeDocument, design, tuple(selection))
+
+    def queue_export(self, destination, fmt, target):
+        # Fusion can only open the temporary document outside a command transaction.
+        self.pending_exports.append((destination, fmt, target))
+        # Fusion can report False even when it delivers the event.
+        self.app.fireCustomEvent(SELECTION_EXPORT_EVENT)
 
     def refresh_cache_label(self):
         try:
@@ -265,14 +352,46 @@ class Addin:
         else:
             self.ui.statusMessage = f"ExporTo cache cleared ({format_size(deleted)})."
 
-    def export(self, destination, fmt, document, design, entity):
+    def save_file(self, fmt, document, design, entities, name):
+        dialog = self.ui.createFileDialog()
+        dialog.title = f"Save {fmt.upper()} file"
+        dialog.filter = "STEP files (*.step;*.stp)" if fmt == "step" else "STL files (*.stl)"
+        dialog.initialFilename = export_filename(name, f".{fmt}")
+        if dialog.showSave() != adsk.core.DialogResults.DialogOK:
+            return
+        path = Path(dialog.filename)
+        suffixes = {".step", ".stp"} if fmt == "step" else {".stl"}
+        if path.suffix.casefold() not in suffixes:
+            path = path.with_name(path.name + f".{fmt}")
+            if path.exists() and self.ui.messageBox(
+                f"Replace {path.name}?", dialog.title, adsk.core.MessageBoxButtonTypes.YesNoButtonType
+            ) != adsk.core.DialogResults.DialogYes:
+                return
+        self.check_selection(document, entities)
+        with tempfile.TemporaryDirectory(dir=path.parent) as directory:
+            staged = Path(directory) / path.name
+            export_selection(design, entities, fmt, staged)
+            staged.replace(path)
+        self.ui.statusMessage = f"Saved {path.name}."
+
+    def check_selection(self, document, entities):
+        if self.app.activeDocument != document or any(not entity.isValid for entity in entities):
+            raise RuntimeError("The Fusion selection is no longer available.")
+
+    def export(self, destination, fmt, document, design, entities):
         path = None
         try:
-            if self.app.activeDocument != document or not entity.isValid:
-                raise RuntimeError("The Fusion selection is no longer available.")
-            name = document.name if entity == design.rootComponent else entity.name
+            self.check_selection(document, entities)
+            name = document.name
+            if len(entities) > 1:
+                name += " - Selection"
+            elif entities[0] != design.rootComponent:
+                name = entities[0].name
+            if destination is None:
+                self.save_file(fmt, document, design, entities, name)
+                return
             path = export_path(name, destination.suffix or f".{fmt}")
-            export_model(design, entity, path)
+            export_selection(design, entities, fmt, path)
             platform_apps.launch_app(destination, path)
         except Exception as error:
             if path:
