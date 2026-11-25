@@ -1,6 +1,6 @@
 {
   "name": "ExporTo",
   "display_name": "ExporTo",
-  "description": "Send Fusion models as STEP or STL to locally installed applications.",
+  "description": "Export Fusion models and sketches to local files or installed applications.",
   "initialized": true
 }

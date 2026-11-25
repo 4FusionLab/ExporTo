@@ -14,22 +14,35 @@ from xml.parsers.expat import ExpatError
 
 
 App = namedtuple("App", "name path formats icon executable arguments suffix", defaults=(None, None, (), None))
-EXTENSIONS = {"step": (".step", ".stp"), "stl": (".stl",)}
+EXTENSIONS = {
+    "step": (".step", ".stp"),
+    "stl": (".stl",),
+    "3mf": (".3mf",),
+    "dxf": (".dxf",),
+    "f3d": (".f3d",),
+    "iges": (".iges", ".igs"),
+    "obj": (".obj",),
+    "sat": (".sat",),
+    "smt": (".smt",),
+    "svg": (".svg",),
+    "usdz": (".usdz",),
+}
 # Some applications import these formats without registering a system file handler.
 KNOWN_APPS = (
-    ("Bambu Studio", ("bambustudio",), ("step", "stl")),
-    ("OrcaSlicer", ("orcaslicer",), ("step", "stl")),
-    ("PrusaSlicer", ("prusaslicer",), ("step", "stl")),
+    ("Bambu Studio", ("bambustudio",), ("step", "stl", "3mf", "obj")),
+    ("OrcaSlicer", ("orcaslicer",), ("step", "stl", "3mf", "obj")),
+    ("PrusaSlicer", ("prusaslicer",), ("step", "stl", "3mf", "obj")),
     ("Creality Print", ("crealityprint",), ("step", "stl")),
     ("QIDI Studio", ("qidistudio",), ("step", "stl")),
     ("UltiMaker Cura", ("ultimakercura", "cura"), ("stl",)),
     ("ideaMaker", ("ideamaker",), ("stl",)),
     ("Blender", ("blender",), ("stl",)),
-    ("FreeCAD", ("freecad",), ("step", "stl")),
-    ("Shapr3D", ("shapr3d",), ("step", "stl")),
-    ("Rhino", ("rhinoceros", "rhino"), ("step", "stl")),
-    ("Autodesk Inventor", ("inventor",), ("step", "stl")),
-    ("SOLIDWORKS", ("sldworks", "solidworks"), ("step", "stl")),
+    ("FreeCAD", ("freecad",), ("step", "stl", "iges", "dxf")),
+    ("Shapr3D", ("shapr3d",), ("step", "stl", "iges", "dxf")),
+    ("Rhino", ("rhinoceros", "rhino"), ("step", "stl", "iges", "dxf", "obj")),
+    ("Autodesk Inventor", ("inventor",), ("step", "stl", "iges", "sat", "dxf")),
+    ("SOLIDWORKS", ("sldworks", "solidworks"), ("step", "stl", "iges")),
+    ("Inkscape", ("inkscape",), ("svg",)),
 )
 IGNORED_EXECUTABLES = {
     "cmd", "explorer", "rundll32", "powershell", "pwsh", "wscript", "cscript", "mshta",
@@ -38,6 +51,12 @@ IGNORED_EXECUTABLES = {
 MAC_TYPES = {
     "step": {"public.step", "public.step-file", "public.stp", "com.apple.step", "model.step"},
     "stl": {"public.stl", "public.standard-tessellated-geometry-format", "com.apple.stl", "model.stl"},
+    "3mf": {"public.3mf", "org.3mf.3mf"},
+    "dxf": {"com.autodesk.dxf"},
+    "iges": {"public.iges", "com.autodesk.iges"},
+    "obj": {"public.wavefront-obj", "com.wavefront.obj"},
+    "svg": {"public.svg-image"},
+    "usdz": {"com.pixar.universal-scene-description-mobile"},
 }
 ICON_SIZES = {
     "16x16.png": 16,
@@ -93,7 +112,7 @@ def mac_bundles():
 
 
 def mac_formats(info):
-    types = {key: set(values) for key, values in MAC_TYPES.items()}
+    types = {key: set(MAC_TYPES.get(key, ())) for key in EXTENSIONS}
     for declaration in (*info.get("UTImportedTypeDeclarations", ()), *info.get("UTExportedTypeDeclarations", ())):
         identifier = declaration.get("UTTypeIdentifier", "").casefold()
         tags = declaration.get("UTTypeTagSpecification", {}).get("public.filename-extension", ())
@@ -122,12 +141,17 @@ def mac_apps():
             with (bundle / "Contents" / "Info.plist").open("rb") as stream:
                 info = plistlib.load(stream)
             identifier = info.get("CFBundleIdentifier", "").casefold()
+            if identifier == "com.apple.archiveutility":
+                continue
             if identifier.startswith(("com.autodesk.fusion", "com.autodesk.dls.streamer.scriptapp.autodesk-fusion")):
                 continue
             label = info.get("CFBundleDisplayName") or info.get("CFBundleName") or bundle.stem
             known_name, known_formats = known_app(bundle.stem)
             if not known_name:
                 known_name, known_formats = known_app(label)
+            if known_name == "FreeCAD":
+                # The macOS bundle does not reliably accept unregistered IGES or DXF open events.
+                known_formats = ("step", "stl")
             formats = mac_formats(info).union(known_formats)
             executable = bundle / "Contents" / "MacOS" / info.get("CFBundleExecutable", "")
             if not formats or not executable.is_file():
