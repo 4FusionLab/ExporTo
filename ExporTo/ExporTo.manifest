@@ -2,7 +2,7 @@
   "autodeskProduct": "Fusion360",
   "type": "addin",
   "id": "403a5066-fb9d-4cfe-8372-0c54f488138a",
-  "author": "DiegoV",
+  "author": "Pavel Kuznetsov",
   "description": {"": "Export Fusion models and sketches to local files or installed applications."},
   "version": "1.0.0",
   "runOnStartup": true,
